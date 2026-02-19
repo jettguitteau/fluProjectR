@@ -1,0 +1,170 @@
+---
+Title: "Google Trends and Influenza-like Illness"
+Format: HTML
+
+execute:
+  warning: false
+  message: false
+---
+
+### Introduction
+
+In this document, we investigated Google trend data of the search term "flu symptoms" and how it relates to the CDC data of influenza-like illness (ILI) visits in outpatient clinics. We want to see how strong the correlation of these two data sets is, and, if the correlation is strong, we will create a simple machine learning model to predict visits given a certain number of hits within Google trends. Our analysis may allow us to see if pre-COVID-19 pandemic visits can predict post-pandemic ILI visits. If we find our model is accurate, we will be able to predict ILI outpatient visits based on Google trends hits. If it's not accurate, it will pose further questions as to how the pandemic has changed the relationship between our search term and ILI visits. 
+
+### Obtaining the Data
+
+The data used comes from two sources. The first is the Google trends data of the search term "flu symptoms", this was pulled using the `gtrendsR` library. The second data set was downloaded from the CDC's "ILINet State Activity Indicator Map" and loaded into R. 
+
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(lubridate)
+library(gtrendsR)
+```
+
+Using our `tidyverse` library we are able to load the CDC data into R, and `lubridate` is used to format the date column properly.
+
+```{r}
+# Loading the CDC data
+cdcdata <- read_csv('../data/cdcdata.csv')
+
+# Cleaning data: removing unnecessary columns, renaming columns for clarity, changing data types for analysis
+cdcdata <- cdcdata %>%
+  select(-URL, -WEBSITE) %>%
+  rename(DATE = WEEKEND) %>%
+  mutate(`ACTIVITY LEVEL` = parse_number(`ACTIVITY LEVEL`)) %>%
+  mutate(DATE = mdy(DATE))
+
+# Aggregating data to be one national data set based on date and average activity level.
+cdcus <- cdcdata %>%
+  group_by(DATE) %>%
+  summarize(ACTIVITY_LEVEL = mean(`ACTIVITY LEVEL`, na.rm = TRUE))
+```
+
+Then we are able to use `gtrendsR` to create a data frame including the date and hits for the search trends for our keyword. 
+
+```{r}
+trends <- gtrends(
+  keyword = "flu symptoms",
+  geo = "US",
+  time = "2014-10-01 2026-02-01"
+)
+
+# Select the columns we want for analysis.
+trends_by_time <- trends$interest_over_time %>%
+  select(date, hits)
+```
+
+### Exploring the Data
+
+Now we can plot the data to get an idea of what the data looks like and see if the data sets appear to correlate. We will start with the CDC data. 
+
+```{r}
+cdc_viz <- cdcus %>% ggplot(aes(x=DATE, y=ACTIVITY_LEVEL)) +
+  geom_line() +
+  labs(title = "CDC Activity Level for ILI Visits", x = "Date", y = "Activity Level (1-12)")
+cdc_viz
+```
+
+Now we will plot the Google trends data. 
+
+```{r}
+gtrends_viz <- trends_by_time %>% ggplot(aes(x=date, y=hits)) +
+  geom_line() +
+  labs(title = "Hits for 'flu symptoms' from Google Trends", x = "Date", y = "Hits")
+gtrends_viz
+```
+
+As we can see, these are nearly identically shaped visualizations, indicating they have a strong correlation. But let's ensure this is true and support it statistically. We will do this by merging the data and testing their correlation. However, the Google data is monthly whereas the CDC data is weekly, so we need to alter the data to allow a join. This can be done by grouping by month for the CDC data. 
+
+```{r}
+cdc_monthly <- cdcus %>% 
+  mutate(date = floor_date(DATE, unit = "month")) %>%
+  group_by(date) %>%
+  summarize(mean_activity = mean(ACTIVITY_LEVEL, na.rm = TRUE))
+```
+
+Now we can merge our data that is aggregated by month and perform correlation tests to determine if there is a linear correlation, which is required for linear regression. 
+
+```{r}
+merged <- trends_by_time %>%
+  left_join(cdc_monthly, by = "date")
+```
+
+We want to create a scatter plot to visualize the correlation between the two variables. Additionally, we are calculating the correlation coefficient. 
+
+```{r}
+scatterplot <- ggplot(merged, aes(x = hits, y = mean_activity)) +
+  geom_point() +
+  labs(
+    x = "Google Trends Hits",
+    y = "Mean ILI Activity",
+    title = "Scatterplot of ILI Activity vs Google Searches"
+  )
+scatterplot
+```
+```{r}
+coefficient <- cor.test(merged$mean_activity, merged$hits)
+coefficient$estimate
+```
+
+There seems to be a linear relationship between our variables in the scatter plot, which is confirmed by the correlation coefficient of 0.84. 
+
+```{r}
+# The scatterplot showed probable outliers, boxplot confirms outliers and they are removed. 
+boxplot <- ggplot(merged, aes(hits, hits)) +
+  geom_boxplot()
+merged <- merged %>%
+  filter(hits < 55)
+```
+
+### Exploring Linear Regression
+
+Now that we have confirmed linearity and removed outliers, we can create our simple linear regression model. We want to determine if the Google search hits are a good predictor of actual ILI visits, so we will split the data into a training and testing set, splitting by 2020. This leaves us with pre and post COVID data, allowing us to test if our pre-COVID data allows for an accurate model in a post-COVID world.  
+
+```{r}
+# Splitting data.
+cutoff <- "2020-01-01"
+train <- merged %>%
+  filter(date < cutoff)
+test <- merged %>%
+  filter(date >= cutoff)
+# Creating model on training data.
+model <- lm(mean_activity ~ hits, data = train)
+summary(model)
+```
+
+The summary of our model tells us a lot of information. For every 1-unit increase in Google Trends “hits”, ILI activity increases by 0.205 units on average. Our P-value is very significant as well, as it is < 2e-16. Additionally, our R-squared value of 0.903 indicates that about 90.3% of variation in ILI activity can be explained by Google searches. Our residual standard error is 0.6425, meaning predictions are off by about 0.64 units of ILI activity on average in training data. Model assumptions were assessed visually and showed no major violations. 
+
+We can visualize our model as well below in blue, with a LOESS smoother in red.
+
+```{r}
+plot_loess <- ggplot(train, aes(x = hits, y = mean_activity)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  geom_smooth(se=FALSE, color='red') +
+  labs(title = "Google Hits to ILI Activity", x = "Hits", y = "Mean Activity")
+plot_loess
+```
+
+Next, we can use our test data to compare predicted values and see how well the model does on this data. 
+
+```{r}
+test$predicted <- predict(model, newdata = test)
+rmse <- sqrt(mean((test$mean_activity - test$predicted)^2, na.rm = TRUE))
+rmse
+train$predicted <- predict(model, newdata = train)
+train_rmse <- sqrt(mean((train$mean_activity - train$predicted)^2))
+train_rmse
+# Viewing the range of the activity to contextualize the RMSE values. 
+range(merged$mean_activity, na.rm = TRUE)
+```
+
+The model trained on pre-COVID data had an RMSE of 0.63 on the training set, while its predictions on post-COVID data had an RMSE of 1.03. This represents a ~64% increase in prediction error, indicating that the relationship between Google searches and ILI activity became less reliable after COVID. 
+
+### Conclusion and Further Steps
+
+While prior to the pandemic, there is a strong indicator that Google search activity for "flu symptoms" could be a good predictor of outpatient ILI visits, this is less reliable in a post-COVID world. This is likely explained by COVID's influence on Google search hits, as "covid symptoms" may replace "flu symptoms" in searches. Additionally, ILI numbers will change as COVID visits would be included. These factors likely make this model not as valid today. However, the model is still usable, it just is no longer as accurate as it once would have been.
+
+If we wanted a model that could more accurately make predictions, splitting the data by a more recent date could be better. For example, splitting the data by 2023 would allow 3 years of post-COVID data to influence the original model, and then the years after 2023 could be the test data. Perhaps, this would provide a more useful model, which would simply be a predictive model and no longer be comparing pre-COVID and post-COVID numbers. 
